@@ -17,6 +17,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var gpuMenuItem: NSMenuItem!
     var powerMenuItem: NSMenuItem!
 
+    // CPU使用率計算用（前回の値を保存）
+    var prevCPUInfo: [Int64] = []
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // デフォルト値を設定（初回起動時は全て表示）
         registerDefaults()
@@ -141,7 +144,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // CPU使用率を取得
+    // CPU使用率を取得（差分計算）
     func getCPUUsage() -> Double {
         var cpuInfo: processor_info_array_t?
         var numCpuInfo: mach_msg_type_number_t = 0
@@ -157,31 +160,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return 0.0
         }
 
-        var totalUsage: Double = 0.0
+        let statesPerCPU = Int(CPU_STATE_MAX)
+        let totalStates = Int(numCPUs) * statesPerCPU
 
-        for i in 0..<Int(numCPUs) {
-            let offset = Int(CPU_STATE_MAX) * i
-            let user = Double(cpuInfo[offset + Int(CPU_STATE_USER)])
-            let system = Double(cpuInfo[offset + Int(CPU_STATE_SYSTEM)])
-            let nice = Double(cpuInfo[offset + Int(CPU_STATE_NICE)])
-            let idle = Double(cpuInfo[offset + Int(CPU_STATE_IDLE)])
-
-            let total = user + system + nice + idle
-            let used = user + system + nice
-
-            if total > 0 {
-                totalUsage += (used / total) * 100.0
-            }
+        // 現在の値を配列に変換
+        var currentInfo: [Int64] = []
+        for i in 0..<totalStates {
+            currentInfo.append(Int64(cpuInfo[i]))
         }
 
         // メモリ解放
         let cpuInfoSize = vm_size_t(numCpuInfo) * vm_size_t(MemoryLayout<integer_t>.stride)
         vm_deallocate(mach_task_self_, vm_address_t(bitPattern: cpuInfo), cpuInfoSize)
 
+        // 前回の値がない、またはサイズが異なる場合は保存して0を返す
+        if prevCPUInfo.isEmpty || prevCPUInfo.count != currentInfo.count {
+            prevCPUInfo = currentInfo
+            return 0.0
+        }
+
+        var totalUsage: Double = 0.0
+
+        for i in 0..<Int(numCPUs) {
+            let offset = statesPerCPU * i
+
+            // 差分を計算
+            let userDiff = currentInfo[offset + Int(CPU_STATE_USER)] - prevCPUInfo[offset + Int(CPU_STATE_USER)]
+            let systemDiff = currentInfo[offset + Int(CPU_STATE_SYSTEM)] - prevCPUInfo[offset + Int(CPU_STATE_SYSTEM)]
+            let niceDiff = currentInfo[offset + Int(CPU_STATE_NICE)] - prevCPUInfo[offset + Int(CPU_STATE_NICE)]
+            let idleDiff = currentInfo[offset + Int(CPU_STATE_IDLE)] - prevCPUInfo[offset + Int(CPU_STATE_IDLE)]
+
+            let totalDiff = userDiff + systemDiff + niceDiff + idleDiff
+            let usedDiff = userDiff + systemDiff + niceDiff
+
+            if totalDiff > 0 {
+                totalUsage += (Double(usedDiff) / Double(totalDiff)) * 100.0
+            }
+        }
+
+        // 現在の値を保存
+        prevCPUInfo = currentInfo
+
         return totalUsage / Double(numCPUs)
     }
 
-    // メモリ使用率を取得
+    // メモリ使用率を取得（Activity Monitor準拠）
     func getMemoryUsage() -> Double {
         var stats = vm_statistics64()
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
@@ -196,20 +219,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return 0.0
         }
 
-        let pageSize = Double(vm_kernel_page_size)
-        let active = Double(stats.active_count) * pageSize
-        let wired = Double(stats.wire_count) * pageSize
-        let compressed = Double(stats.compressor_page_count) * pageSize
-
         // 物理メモリ総量を取得
         var size = MemoryLayout<UInt64>.size
         var totalMemory: UInt64 = 0
         sysctlbyname("hw.memsize", &totalMemory, &size, nil, 0)
 
-        let used = active + wired + compressed
-        let total = Double(totalMemory)
+        let pageSize = Double(vm_kernel_page_size)
+        let totalPages = Double(totalMemory) / pageSize
 
-        return (used / total) * 100.0
+        // 空きメモリ = free + inactive + purgeable + speculative
+        let free = Double(stats.free_count)
+        let inactive = Double(stats.inactive_count)
+        let purgeable = Double(stats.purgeable_count)
+        let speculative = Double(stats.speculative_count)
+
+        let freePages = free + inactive + purgeable + speculative
+        let usedPages = totalPages - freePages
+
+        return (usedPages / totalPages) * 100.0
     }
 
     // GPU使用率を取得 (Apple Silicon)
