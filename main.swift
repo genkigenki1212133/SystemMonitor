@@ -64,6 +64,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(powerMenuItem)
 
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Donate", action: #selector(openDonate), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "終了", action: #selector(quit), keyEquivalent: "q"))
 
         statusItem.menu = menu
@@ -95,6 +96,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(!current, forKey: showPowerKey)
         powerMenuItem.state = !current ? .on : .off
         updateStatus()
+    }
+
+    @objc func openDonate() {
+        if let url = URL(string: "https://github.com/sponsors/genkigenki1212133") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc func quit() {
