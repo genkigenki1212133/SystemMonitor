@@ -273,7 +273,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    // 電源ワット数を取得
+    // 現在の消費電力を取得 (mW -> W)
     func getPowerWatts() -> Int? {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
         guard service != 0 else { return nil }
@@ -285,10 +285,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
 
-        // AdapterDetailsからWattsを取得
-        if let adapterDetails = props["AdapterDetails"] as? [String: Any],
-           let watts = adapterDetails["Watts"] as? Int {
-            return watts
+        // PowerTelemetryDataから実際の消費電力を取得
+        if let telemetry = props["PowerTelemetryData"] as? [String: Any],
+           let powerMw = telemetry["SystemPowerIn"] as? Int {
+            return powerMw / 1000  // mW -> W
         }
 
         return nil
