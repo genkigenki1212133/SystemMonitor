@@ -5,14 +5,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
 
+    // 表示設定のキー
+    let showCPUKey = "showCPU"
+    let showMemoryKey = "showMemory"
+    let showGPUKey = "showGPU"
+    let showPowerKey = "showPower"
+
+    // メニュー項目
+    var cpuMenuItem: NSMenuItem!
+    var memoryMenuItem: NSMenuItem!
+    var gpuMenuItem: NSMenuItem!
+    var powerMenuItem: NSMenuItem!
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // デフォルト値を設定（初回起動時は全て表示）
+        registerDefaults()
+
         // メニューバーアイテムを作成
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         // メニューを設定
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "終了", action: #selector(quit), keyEquivalent: "q"))
-        statusItem.menu = menu
+        setupMenu()
 
         // 1秒ごとに更新
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -21,21 +34,102 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         timer?.fire()
     }
 
+    func registerDefaults() {
+        UserDefaults.standard.register(defaults: [
+            showCPUKey: true,
+            showMemoryKey: true,
+            showGPUKey: true,
+            showPowerKey: true
+        ])
+    }
+
+    func setupMenu() {
+        let menu = NSMenu()
+
+        // 表示項目の設定
+        cpuMenuItem = NSMenuItem(title: "CPU", action: #selector(toggleCPU), keyEquivalent: "")
+        cpuMenuItem.state = UserDefaults.standard.bool(forKey: showCPUKey) ? .on : .off
+        menu.addItem(cpuMenuItem)
+
+        memoryMenuItem = NSMenuItem(title: "Memory", action: #selector(toggleMemory), keyEquivalent: "")
+        memoryMenuItem.state = UserDefaults.standard.bool(forKey: showMemoryKey) ? .on : .off
+        menu.addItem(memoryMenuItem)
+
+        gpuMenuItem = NSMenuItem(title: "GPU", action: #selector(toggleGPU), keyEquivalent: "")
+        gpuMenuItem.state = UserDefaults.standard.bool(forKey: showGPUKey) ? .on : .off
+        menu.addItem(gpuMenuItem)
+
+        powerMenuItem = NSMenuItem(title: "Power (W)", action: #selector(togglePower), keyEquivalent: "")
+        powerMenuItem.state = UserDefaults.standard.bool(forKey: showPowerKey) ? .on : .off
+        menu.addItem(powerMenuItem)
+
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "終了", action: #selector(quit), keyEquivalent: "q"))
+
+        statusItem.menu = menu
+    }
+
+    @objc func toggleCPU() {
+        let current = UserDefaults.standard.bool(forKey: showCPUKey)
+        UserDefaults.standard.set(!current, forKey: showCPUKey)
+        cpuMenuItem.state = !current ? .on : .off
+        updateStatus()
+    }
+
+    @objc func toggleMemory() {
+        let current = UserDefaults.standard.bool(forKey: showMemoryKey)
+        UserDefaults.standard.set(!current, forKey: showMemoryKey)
+        memoryMenuItem.state = !current ? .on : .off
+        updateStatus()
+    }
+
+    @objc func toggleGPU() {
+        let current = UserDefaults.standard.bool(forKey: showGPUKey)
+        UserDefaults.standard.set(!current, forKey: showGPUKey)
+        gpuMenuItem.state = !current ? .on : .off
+        updateStatus()
+    }
+
+    @objc func togglePower() {
+        let current = UserDefaults.standard.bool(forKey: showPowerKey)
+        UserDefaults.standard.set(!current, forKey: showPowerKey)
+        powerMenuItem.state = !current ? .on : .off
+        updateStatus()
+    }
+
     @objc func quit() {
         NSApplication.shared.terminate(nil)
     }
 
     func updateStatus() {
-        let cpu = getCPUUsage()
-        let memory = getMemoryUsage()
-        let gpu = getGPUUsage()
+        var parts: [String] = []
+
+        if UserDefaults.standard.bool(forKey: showCPUKey) {
+            let cpu = getCPUUsage()
+            parts.append(String(format: "CPU:%.0f%%", cpu))
+        }
+
+        if UserDefaults.standard.bool(forKey: showMemoryKey) {
+            let memory = getMemoryUsage()
+            parts.append(String(format: "MEM:%.0f%%", memory))
+        }
+
+        if UserDefaults.standard.bool(forKey: showGPUKey) {
+            if let gpu = getGPUUsage() {
+                parts.append(String(format: "GPU:%.0f%%", gpu))
+            }
+        }
+
+        if UserDefaults.standard.bool(forKey: showPowerKey) {
+            if let power = getPowerWatts() {
+                parts.append(String(format: "%dW", power))
+            } else {
+                parts.append("--W")
+            }
+        }
 
         if let button = statusItem.button {
-            if let gpu = gpu {
-                button.title = String(format: "CPU:%.0f%% MEM:%.0f%% GPU:%.0f%%", cpu, memory, gpu)
-            } else {
-                button.title = String(format: "CPU:%.0f%% MEM:%.0f%% GPU:--", cpu, memory)
-            }
+            button.title = parts.isEmpty ? "---" : parts.joined(separator: " ")
             button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         }
     }
@@ -140,6 +234,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                let utilization = perfStats["Device Utilization %"] as? Int {
                 return Double(utilization)
             }
+        }
+
+        return nil
+    }
+
+    // 電源ワット数を取得
+    func getPowerWatts() -> Int? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+
+        var properties: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let props = properties?.takeRetainedValue() as? [String: Any] else {
+            return nil
+        }
+
+        // AdapterDetailsからWattsを取得
+        if let adapterDetails = props["AdapterDetails"] as? [String: Any],
+           let watts = adapterDetails["Watts"] as? Int {
+            return watts
         }
 
         return nil
