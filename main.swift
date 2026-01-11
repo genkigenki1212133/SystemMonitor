@@ -1,5 +1,6 @@
 import Cocoa
 import IOKit
+import ServiceManagement
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -16,6 +17,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var memoryMenuItem: NSMenuItem!
     var gpuMenuItem: NSMenuItem!
     var powerMenuItem: NSMenuItem!
+    var launchAtLoginMenuItem: NSMenuItem!
 
     // CPU使用率計算用（前回の値を保存）
     var prevCPUInfo: [Int64] = []
@@ -67,6 +69,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(powerMenuItem)
 
         menu.addItem(NSMenuItem.separator())
+
+        launchAtLoginMenuItem = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        launchAtLoginMenuItem.state = isLaunchAtLoginEnabled() ? .on : .off
+        menu.addItem(launchAtLoginMenuItem)
+
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Donate", action: #selector(openDonate), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "終了", action: #selector(quit), keyEquivalent: "q"))
 
@@ -99,6 +107,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(!current, forKey: showPowerKey)
         powerMenuItem.state = !current ? .on : .off
         updateStatus()
+    }
+
+    @objc func toggleLaunchAtLogin() {
+        if #available(macOS 13.0, *) {
+            let service = SMAppService.mainApp
+            do {
+                if service.status == .enabled {
+                    try service.unregister()
+                    launchAtLoginMenuItem.state = .off
+                } else {
+                    try service.register()
+                    launchAtLoginMenuItem.state = .on
+                }
+            } catch {
+                print("Failed to toggle launch at login: \(error)")
+            }
+        }
+    }
+
+    func isLaunchAtLoginEnabled() -> Bool {
+        if #available(macOS 13.0, *) {
+            return SMAppService.mainApp.status == .enabled
+        }
+        return false
     }
 
     @objc func openDonate() {
