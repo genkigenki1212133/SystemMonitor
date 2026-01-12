@@ -2,6 +2,19 @@ import Cocoa
 import IOKit
 import ServiceManagement
 
+private enum Constants {
+    /// タイマーの更新間隔（秒）
+    static let timerInterval: TimeInterval = 1.0
+    /// メニューバーのフォントサイズ
+    static let menuBarFontSize: CGFloat = 12
+    /// ミリワットからワットへの変換係数
+    static let milliwattsPerWatt: Int = 1000
+    /// 高負荷の閾値（%）
+    static let highLoadThreshold: Double = 80
+    /// 中負荷の閾値（%）
+    static let mediumLoadThreshold: Double = 50
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
@@ -11,16 +24,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let showMemoryKey = "showMemory"
     let showGPUKey = "showGPU"
     let showPowerKey = "showPower"
+    let showNetworkKey = "showNetwork"
 
     // メニュー項目
     var cpuMenuItem: NSMenuItem!
     var memoryMenuItem: NSMenuItem!
     var gpuMenuItem: NSMenuItem!
     var powerMenuItem: NSMenuItem!
+    var networkMenuItem: NSMenuItem!
     var launchAtLoginMenuItem: NSMenuItem!
+
+    // ネットワーク速度計算用
+    var prevNetworkBytes: (sent: UInt64, received: UInt64) = (0, 0)
+    var prevNetworkTime: Date?
 
     // CPU使用率計算用（前回の値を保存）
     var prevCPUInfo: [Int64] = []
+
+    // バッテリーの有無（キャッシュ）
+    lazy var deviceHasBattery: Bool = hasBattery()
+
+    /// バッテリーの有無を確認する
+    /// デスクトップMac（iMac, Mac mini, Mac Studio, Mac Pro）にはバッテリーがないため、
+    /// AppleSmartBatteryサービスの存在で判定する
+    func hasBattery() -> Bool {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        if service != 0 {
+            IOObjectRelease(service)
+            return true
+        }
+        return false
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // デフォルト値を設定（初回起動時は全て表示）
@@ -33,7 +67,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenu()
 
         // 1秒ごとに更新
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: Constants.timerInterval, repeats: true) { [weak self] _ in
             self?.updateStatus()
         }
         timer?.fire()
@@ -44,7 +78,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             showCPUKey: true,
             showMemoryKey: true,
             showGPUKey: true,
-            showPowerKey: true
+            showPowerKey: true,
+            showNetworkKey: true
         ])
     }
 
@@ -64,9 +99,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         gpuMenuItem.state = UserDefaults.standard.bool(forKey: showGPUKey) ? .on : .off
         menu.addItem(gpuMenuItem)
 
-        powerMenuItem = NSMenuItem(title: "Power (W)", action: #selector(togglePower), keyEquivalent: "")
-        powerMenuItem.state = UserDefaults.standard.bool(forKey: showPowerKey) ? .on : .off
-        menu.addItem(powerMenuItem)
+        // バッテリーがある場合のみ電力メニュー項目を追加
+        if deviceHasBattery {
+            powerMenuItem = NSMenuItem(title: "Power (W)", action: #selector(togglePower), keyEquivalent: "")
+            powerMenuItem.state = UserDefaults.standard.bool(forKey: showPowerKey) ? .on : .off
+            menu.addItem(powerMenuItem)
+        }
+
+        networkMenuItem = NSMenuItem(title: "Network", action: #selector(toggleNetwork), keyEquivalent: "")
+        networkMenuItem.state = UserDefaults.standard.bool(forKey: showNetworkKey) ? .on : .off
+        menu.addItem(networkMenuItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -81,32 +123,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    @objc func toggleCPU() {
-        let current = UserDefaults.standard.bool(forKey: showCPUKey)
-        UserDefaults.standard.set(!current, forKey: showCPUKey)
-        cpuMenuItem.state = !current ? .on : .off
+    /// 汎用トグル関数: UserDefaultsの値を反転し、メニュー項目の状態を更新
+    private func toggle(key: String, menuItem: NSMenuItem) {
+        let current = UserDefaults.standard.bool(forKey: key)
+        UserDefaults.standard.set(!current, forKey: key)
+        menuItem.state = !current ? .on : .off
         updateStatus()
+    }
+
+    @objc func toggleCPU() {
+        toggle(key: showCPUKey, menuItem: cpuMenuItem)
     }
 
     @objc func toggleMemory() {
-        let current = UserDefaults.standard.bool(forKey: showMemoryKey)
-        UserDefaults.standard.set(!current, forKey: showMemoryKey)
-        memoryMenuItem.state = !current ? .on : .off
-        updateStatus()
+        toggle(key: showMemoryKey, menuItem: memoryMenuItem)
     }
 
     @objc func toggleGPU() {
-        let current = UserDefaults.standard.bool(forKey: showGPUKey)
-        UserDefaults.standard.set(!current, forKey: showGPUKey)
-        gpuMenuItem.state = !current ? .on : .off
-        updateStatus()
+        toggle(key: showGPUKey, menuItem: gpuMenuItem)
     }
 
     @objc func togglePower() {
-        let current = UserDefaults.standard.bool(forKey: showPowerKey)
-        UserDefaults.standard.set(!current, forKey: showPowerKey)
-        powerMenuItem.state = !current ? .on : .off
-        updateStatus()
+        toggle(key: showPowerKey, menuItem: powerMenuItem)
+    }
+
+    @objc func toggleNetwork() {
+        toggle(key: showNetworkKey, menuItem: networkMenuItem)
     }
 
     @objc func toggleLaunchAtLogin() {
@@ -143,36 +185,104 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
+    /// 負荷レベルに応じた色を返す
+    /// - Parameter percentage: 負荷のパーセンテージ（0-100）
+    /// - Returns: 負荷レベルに対応するNSColor
+    func colorForLoad(_ percentage: Double) -> NSColor {
+        if percentage >= Constants.highLoadThreshold {
+            return .systemRed
+        } else if percentage >= Constants.mediumLoadThreshold {
+            return .systemOrange
+        } else {
+            return .labelColor
+        }
+    }
+
     func updateStatus() {
-        var parts: [String] = []
+        let font = NSFont.monospacedDigitSystemFont(ofSize: Constants.menuBarFontSize, weight: .regular)
+        let attributedString = NSMutableAttributedString()
+
+        /// 区切りのスペースを追加するヘルパー関数
+        func appendSeparatorIfNeeded() {
+            if attributedString.length > 0 {
+                attributedString.append(NSAttributedString(string: " ", attributes: [.font: font]))
+            }
+        }
 
         if UserDefaults.standard.bool(forKey: showCPUKey) {
             let cpu = getCPUUsage()
-            parts.append(String(format: "CPU:%.0f%%", cpu))
+            let text = String(format: "CPU:%.0f%%", cpu)
+            let color = colorForLoad(cpu)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .foregroundColor: color,
+                .font: font
+            ]
+            appendSeparatorIfNeeded()
+            attributedString.append(NSAttributedString(string: text, attributes: attributes))
         }
 
         if UserDefaults.standard.bool(forKey: showMemoryKey) {
             let memory = getMemoryUsage()
-            parts.append(String(format: "MEM:%.0f%%", memory))
+            let text = String(format: "MEM:%.0f%%", memory)
+            let color = colorForLoad(memory)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .foregroundColor: color,
+                .font: font
+            ]
+            appendSeparatorIfNeeded()
+            attributedString.append(NSAttributedString(string: text, attributes: attributes))
         }
 
         if UserDefaults.standard.bool(forKey: showGPUKey) {
             if let gpu = getGPUUsage() {
-                parts.append(String(format: "GPU:%.0f%%", gpu))
+                let text = String(format: "GPU:%.0f%%", gpu)
+                let color = colorForLoad(gpu)
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .foregroundColor: color,
+                    .font: font
+                ]
+                appendSeparatorIfNeeded()
+                attributedString.append(NSAttributedString(string: text, attributes: attributes))
             }
         }
 
-        if UserDefaults.standard.bool(forKey: showPowerKey) {
+        // バッテリーがある場合のみ電力を表示（色変更なし）
+        if deviceHasBattery && UserDefaults.standard.bool(forKey: showPowerKey) {
+            let text: String
             if let power = getPowerWatts() {
-                parts.append(String(format: "%dW", power))
+                text = String(format: "%dW", power)
             } else {
-                parts.append("--W")
+                text = "--W"
+            }
+            let attributes: [NSAttributedString.Key: Any] = [
+                .foregroundColor: NSColor.labelColor,
+                .font: font
+            ]
+            appendSeparatorIfNeeded()
+            attributedString.append(NSAttributedString(string: text, attributes: attributes))
+        }
+
+        // ネットワーク速度を表示
+        if UserDefaults.standard.bool(forKey: showNetworkKey) {
+            if let speed = getNetworkSpeed() {
+                let upText = formatSpeed(speed.up)
+                let downText = formatSpeed(speed.down)
+                let text = "\u{2191}\(upText) \u{2193}\(downText)"
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .foregroundColor: NSColor.labelColor,
+                    .font: font
+                ]
+                appendSeparatorIfNeeded()
+                attributedString.append(NSAttributedString(string: text, attributes: attributes))
             }
         }
 
         if let button = statusItem.button {
-            button.title = parts.isEmpty ? "---" : parts.joined(separator: " ")
-            button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            if attributedString.length == 0 {
+                button.attributedTitle = NSAttributedString(string: "---", attributes: [.font: font])
+            } else {
+                button.attributedTitle = attributedString
+            }
         }
     }
 
@@ -320,10 +430,92 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // PowerTelemetryDataから実際の消費電力を取得
         if let telemetry = props["PowerTelemetryData"] as? [String: Any],
            let powerMw = telemetry["SystemPowerIn"] as? Int {
-            return powerMw / 1000  // mW -> W
+            return powerMw / Constants.milliwattsPerWatt  // mW -> W
         }
 
         return nil
+    }
+
+    // ネットワークの送受信バイト数を取得
+    func getNetworkBytes() -> (sent: UInt64, received: UInt64) {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
+            return (0, 0)
+        }
+        defer { freeifaddrs(ifaddr) }
+
+        var totalSent: UInt64 = 0
+        var totalReceived: UInt64 = 0
+
+        var ptr = firstAddr
+        while true {
+            let flags = Int32(ptr.pointee.ifa_flags)
+            let isUp = (flags & IFF_UP) != 0
+            let isRunning = (flags & IFF_RUNNING) != 0
+            let isLoopback = (flags & IFF_LOOPBACK) != 0
+
+            // アクティブな非ループバックインターフェースのみ
+            if isUp && isRunning && !isLoopback {
+                if ptr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_LINK) {
+                    if let data = ptr.pointee.ifa_data {
+                        let ifData = data.assumingMemoryBound(to: if_data.self).pointee
+                        totalSent += UInt64(ifData.ifi_obytes)
+                        totalReceived += UInt64(ifData.ifi_ibytes)
+                    }
+                }
+            }
+
+            if let next = ptr.pointee.ifa_next {
+                ptr = next
+            } else {
+                break
+            }
+        }
+
+        return (totalSent, totalReceived)
+    }
+
+    // ネットワーク速度を計算（bytes per second）
+    func getNetworkSpeed() -> (up: Double, down: Double)? {
+        let currentBytes = getNetworkBytes()
+        let currentTime = Date()
+
+        defer {
+            prevNetworkBytes = currentBytes
+            prevNetworkTime = currentTime
+        }
+
+        guard let prevTime = prevNetworkTime else {
+            return nil
+        }
+
+        let timeDiff = currentTime.timeIntervalSince(prevTime)
+        guard timeDiff > 0 else {
+            return nil
+        }
+
+        let sentDiff = currentBytes.sent >= prevNetworkBytes.sent
+            ? currentBytes.sent - prevNetworkBytes.sent
+            : currentBytes.sent  // オーバーフロー対策
+        let receivedDiff = currentBytes.received >= prevNetworkBytes.received
+            ? currentBytes.received - prevNetworkBytes.received
+            : currentBytes.received  // オーバーフロー対策
+
+        let upSpeed = Double(sentDiff) / timeDiff
+        let downSpeed = Double(receivedDiff) / timeDiff
+
+        return (upSpeed, downSpeed)
+    }
+
+    // 速度を適切な単位でフォーマット
+    func formatSpeed(_ bytesPerSecond: Double) -> String {
+        let kbPerSecond = bytesPerSecond / 1024.0
+        if kbPerSecond >= 1024.0 {
+            let mbPerSecond = kbPerSecond / 1024.0
+            return String(format: "%.1fMB/s", mbPerSecond)
+        } else {
+            return String(format: "%.0fKB/s", kbPerSecond)
+        }
     }
 }
 
